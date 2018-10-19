@@ -1,27 +1,51 @@
 import os
 import hashlib
 import _pickle as cpickle
-import sys
+import sqlite3
 from platform import system
 
 print('Sup dudes')
 
 # #######  Globals and user vars  ##########
-_configfile = "config.db"
 
-# #let's not go off the handle until we're prod ready.  limit 100k results.
-handbrake = 100000
-
-configuration = {
-    "_cwd": os.path.abspath(os.getcwd()),
-    "_fname": os.path.abspath(os.getcwd()),
-    "history": {}
-}
-
-newfiles = {}
-oldfiles = {}
 
 # ####### Class Defs ###########
+
+
+class Config:
+    def __init__(self):
+        self.cwd = os.path.abspath(os.getcwd())
+        self.history = {}
+
+    def load(self):
+        try:
+            with open(_configfile, 'rb') as f:
+                d = cpickle.load(f)
+                self.cwd = d["cwd"]
+                self.history = d["history"]
+        except IOError as e:
+            if e.errno == 2:
+                print("No previous config found.  Using default config.")
+                self.save()
+            else:
+                print("Using default config.  Could not load config.  I/O error({0}): {1}".format(e.errno, e.strerror))
+        return self
+
+    def save(self):
+        try:
+            with open(_configfile, 'wb') as f:
+                d = {
+                    "cwd": self.cwd,
+                    "history": self.history
+                }
+                cpickle.dump(d, f, protocol=3)
+        except IOError as e:
+            print("Unable to save " + _configfile + ": I/O error({0}): {1}".format(e.errno, e.strerror))
+        # except:  # handle other exceptions such as attribute errors
+        #   print("Unable to save " + _configfile + ": ", sys.exc_info()[0])
+
+    def reset(self):
+        self.__init__()
 
 
 # Setting up file class for each file/dir on disk
@@ -36,10 +60,20 @@ class File:
             self.modified = modified
         if state is not None:
             self.state = state
+        self.fullpath = parent + '\\' + name
 
-# No need for this function as we concatinate the full path for dict key later
-#    def fullpath(self):
-#        return self.parent + '\\' + self.name
+# #######   Globals  ###########
+
+
+_configfile = "config.db"
+_config = Config()
+
+# #let's not go off the handle until we're prod ready.  limit 100k results.
+_handbrake = 100000
+
+newfiles = {}
+oldfiles = {}
+
 
 # ####### Generators ###########
 
@@ -74,82 +108,73 @@ def hashedfilename(filename):
     return str(hashlib.md5(filename.encode()).hexdigest()) + ".db"
 
 
-# #Save dict to disk, True if saved, False if not
-def savedict(filename, dictionary):
-    try:
-        with open(filename, 'wb') as f:
-            cpickle.dump(dictionary,f, protocol=3)
-        return True
-    except IOError as e:
-        print("Unable to save " + filename + ": I/O error({0}): {1}".format(e.errno, e.strerror))
-        raise e
-    except:  # handle other exceptions such as attribute errors
-        print("Unexpected error: ", sys.exc_info()[0])
-        raise
-
-
-# #Load dict from disk
-def loaddict(filename):
-    try:
-        with open(filename, 'rb') as f:
-            return cpickle.load(f)
-    except IOError as e:
-        raise e
-    except:  # handle other exceptions such as attribute errors
-        print("Unexpected error: ", sys.exc_info()[0])
-        raise
-
-
-# #Compare file dicts for differences
-def filecompare():
-    global oldfiles
-    global newfiles
-
-    if hashedfilename(configuration["_fname"]) in configuration["history"]:
+# #Open DB for read/write, returns connection object, None if fails
+def opendb(filename):
+    if os.path.isfile(filename):
         try:
-            oldfiles = loaddict(hashedfilename(configuration["_fname"]))
-        except:
-            oldfiles = {}
+            return sqlite3.connect(filename)
+        except sqlite3.DatabaseError as e:
+            print("Could not open existing database: " + str(e))
+            return None
     else:
-        oldfiles = {}
+        try:
+            connection = sqlite3.connect(filename)
+            connection.cursor().execute(
+                '''CREATE TABLE files(
+                      fullpath TEXT PRIMARY KEY,
+                      name TEXT,
+                      parent TEXT,
+                      type TEXT,
+                      size REAL,
+                      modified REAL,
+                      state INT)''')
+            connection.commit()
+            return connection
+        except sqlite3.DatabaseError as e:
+            print("Could not create database: " + str(e))
+            return None
 
-    if len(oldfiles)>0:
-        if len(newfiles)>0:
-            # State: 0=no change, 1=updated, 2=new, 3=deleted
-            for c in newfiles:
-                if c in oldfiles:
-                    if newfiles[c].modified > oldfiles[c].modified:
-                        newfiles[c].state = 1
-                    else:
-                        newfiles[c].state = 0
-                    del (oldfiles[c])
-                else:
-                    newfiles[c].state = 2
 
-            for c in oldfiles:
-                oldfiles[c].state = 3
-                newfiles[c] = oldfiles[c]
-            oldfiles.clear()
-            return True
-        else:
-            print("No scan loaded for current directory, please run scanfiles first.")
-            return True
+# #Insert, update, or delete file from DB
+def filetodb(f: File, connection: sqlite3.Connection):
+    modes = ["UPDATE files set name=?, parent=?, type=?, size=?, modified=?, state=? where fullpath=?",
+             "UPDATE files set name=?, parent=?, type=?, size=?, modified=?, state=? where fullpath=?",
+             "INSERT INTO files (name, parent, type, size, modified, state, fullpath) " +
+             "values(?,?,?,?,?,?,?)",
+             "DELETE FROM files where fullpath=?"]
+    if f.state < 3:
+        connection.cursor().execute(modes[f.state],
+                                    (f.name, f.parent, f.objecttype, f.size, f.modified, f.state, f.fullpath))
+    elif f.state == 3:
+        connection.cursor().execute(modes[f.state],
+                                    (f.fullpath,))
+
+
+# #Read File from DB
+def dbtodict(connection: sqlite3.Connection, mode="all"):
+    d = {}
+    if mode == "updates":
+        query = '''SELECT fullpath, name, parent, type, size, modified, state
+            from files WHERE state > 0'''
     else:
-        print("Since this is the first scan of this directory, make sure to save with savelist.")
-        return True
+        query = '''SELECT fullpath, name, parent, type, size, modified, state
+            from files'''
+    for row in connection.cursor().execute(query):
+        d[row[0]] = File(row[1], row[2], row[3], row[4], row[5], row[6])
+    return d
 
 
 # #Set directory to scan
 def setdir():
-    global configuration
+    global _config
     b = True
     while b:
         directory = input("Enter path to recursively search, c to cancel:  ")
         if directory == "c":
             b = False
         elif os.path.isdir(directory):
-            directory = os.path.abspath(directory)
-            configuration["_cwd"] = directory
+            _config.cwd = os.path.abspath(directory)
+            _config.save()
             b = False
         else:
             print(directory + " doesn't appear to be a directory or access is denied.")
@@ -157,82 +182,155 @@ def setdir():
 
 
 # #List past directories
-def listdirs():
-    for k, v in configuration["history"].items():
-        print("%s : ID - %s" % (v, k))
+def updatehistory():
+    global _config
+    print("Previous Scans:")
+    for k, v in _config.history.items():
+        if os.path.isfile(k):
+            del _config.history[k]
+        else:
+            print("%s :    ID - %s" % (v, k))
+    _config.save()
     _ = input("Press any key to continue")
     return True
 
 
+# #New Scan Logic:
+def scan():
+    global _config
+    if os.path.isdir(_config.cwd):
+        print("Open existing db for current working directory...")
+        with opendb(hashedfilename(_config.cwd)) as dbconn:
+            tempold = dbtodict(dbconn)
+            input("Hit enter to continue")
+            # run generator into newfiles
+            print("Generating list of files under current working directory...")
+            tempnew = scantodict(_config.cwd)
+            input("Hit enter to continue")
+            # run file compare on newfiles, remove all nochanges
+            print("Scanning for changes...")
+            tempnew = filecompare(tempold, tempnew)
+            printfiles(tempnew)
+            input("Hit enter to continue")
+            # iterate filetodb on each newfiles, commit each time (or every 10 maybe?) test commit each time vs at end
+            print("Saving updates...")
+            for f in tempnew:
+                filetodb(tempnew[f], dbconn)
+            dbconn.commit()
+            _config.history[_config.cwd] = hashedfilename(_config.cwd)
+            _config.save()
+            input("Hit enter to continue")
+            # close connection
+            print("Scan complete.  Run upload to begin uploading to S3.")
+            del tempnew
+            del tempold
+    return True
+
+
 # #Scan selected directory
-def scandir():
+def scantodict(cwd) -> dict:
     # #Init generator
-    global configuration
-    global newfiles
-    if os.path.isdir(configuration["_cwd"]):
-        getfiles = files(configuration["_cwd"])
-        totalsize = 0
-        newfiles.clear()
+    tempfiles = {}
+    if os.path.isdir(cwd):
+        getfiles = files(cwd)
         # #Run generator with handbrake, fill dict with full path as key, file objects as values, then delete generator
         try:
-            for x in range(0, handbrake):
+            for x in range(0, _handbrake):
                 f = (next(getfiles))
-                newfiles[f.parent + '\\' + f.name] = f
-                totalsize += os.path.getsize(f.parent + '\\' + f.name)
-                print(f.parent + '\\' + f.name + ",    " + f.type + ", " + str(f.modified))
-                # #Stats
-            print('\nIterated ' + str(x) + ' times. File dictionary is ' + str(len(newfiles)) + ' in length.')
-            print('\nSize of dict in memory is ' + sizeof_fmt(sys.getsizeof(newfiles)))
-            print('\nSize of all files: ' + sizeof_fmt(totalsize))
+                tempfiles[f.fullpath] = f
+                print(f.fullpath + ",    " + f.objecttype + ", " + str(f.modified))
         except StopIteration:
             pass
         finally:
-            configuration["_fname"] = configuration["_cwd"]
             del getfiles
     else:
-        print(configuration["_cwd"] + " either is not a directory, doesn't exist, or denies access.")
+        print(cwd + " either is not a directory, doesn't exist, or denies access.")
+    return tempfiles
 
-    return True
 
-
-# #Save Updates after current scan
-def savelist():
-    global configuration
-    hfn = hashedfilename(configuration["_fname"])
-    if savedict(hfn, newfiles):
-        configuration["history"][hfn] = configuration["_fname"]
-        print('Scan of ' + configuration["_fname"] + ' saved.')
+# #Compare file dicts for differences
+def filecompare(tempold: dict, tempnew: dict) -> dict:
+    if len(tempold) > 0:
+        if len(tempnew) > 0:
+            remove = []
+            # State: 0=no change, 1=updated, 2=new, 3=deleted
+            for c in tempnew:
+                if c in tempold:
+                    if (tempnew[c].modified > tempold[c].modified) and tempold[c].state in [0, 1]:
+                        tempnew[c].state = 1
+                    else:
+                        tempnew[c].state = 0
+                        remove.append(c)
+                    del (tempold[c])
+                else:
+                    tempnew[c].state = 2
+            for c in remove:
+                    del tempnew[c]
+            del remove
+            for c in tempold:
+                tempold[c].state = 3
+                tempnew[c] = tempold[c]
+            del tempold
+        else:
+            print("No files in directory.")
     else:
-        print('Error saving ' + configuration["_fname"])
-    return True
+        print("First scan of directory.  All files will be uploaded.")
+    return tempnew
 
 
 # #Show last scan of current directory, if exists
 def showlast():
-    global oldfiles
-    if hashedfilename(configuration["_cwd"]) in configuration["history"]:
-        try:
-            oldfiles = loaddict(hashedfilename(configuration["_cwd"]))
-            print('Loaded ' + configuration["_cwd"])
-            for c in oldfiles:
-                print('|' + c + '        |   ' + oldfiles[c].type + '|      ' + str(oldfiles[c].modified) + '|    ' + str(
-                    oldfiles[c].size))
-            oldfiles.clear()
-            return True
-        except:
-            print("Could not load last scan for " + configuration["_cwd"])
-            return True
+    if os.path.isfile(hashedfilename(_config.cwd)):
+        with opendb(hashedfilename(_config.cwd)) as dbconn:
+            tempfiles = dbtodict(dbconn)
+            print('Loaded ' + _config.cwd)
+            printfiles(tempfiles)
+            del tempfiles
+        return True
     else:
-        print("%s has no previous scan data. Returning to menu."%configuration["_cwd"])
+        input("%s has no previous scan data or DB file is inaccessible. Hit enter to continue." % _config.cwd)
         return True
 
 
-# #Sync function goes here
-# def sync(File)
-# If new, upload
-# If existing, overwrite
-# If deleted, delete from S3
+# #Sync a file to S3
+def syncfile(file: File) -> bool:
+    # State: 0=no change, 1=updated, 2=new, 3=deleted
+    # If updated, overwrite
+    if file.state == 1:
+        print("Updated %s" % file.fullpath)
+    # If new, upload
+    elif file.state == 2:
+        print("Added %s" % file.fullpath)
+    # If deleted, delete from S3
+    elif file.state == 3:
+        print("Deleted %s" % file.fullpath)
+    else:
+        return False
+    return True
 
+
+# #Run sync for all files in DB, update if sync'd
+def sync():
+    global _config
+    if os.path.isdir(_config.cwd):
+        print("Open existing db for current working directory...")
+        with opendb(hashedfilename(_config.cwd)) as dbconn:
+            files = dbtodict(dbconn, "updates")
+            input("Hit enter to continue")
+            print("Updating S3:")
+            for f in files:
+                print("Processing %s:" % f)
+                if syncfile(files[f]):
+                    files[f].state = 0
+                    filetodb(files[f], dbconn)
+                    dbconn.commit()
+                else:
+                    print("File %s not uploaded." % f)
+            input("Hit enter to continue")
+            # close connection
+            print("Sync to S3 complete.")
+            del files
+    return True
 
 # #S3 verify function goes here
 # load oldfiles for _cwd
@@ -243,33 +341,34 @@ def showlast():
 # #Handy one-shot for clearing CLI
 def clear():
     if system() == "Windows":
-        _=os.system('cls')
+        _ = os.system('cls')
     else:
-        _=os.system('clear')
+        _ = os.system('clear')
 
 
 # #Garbage function for debugging
 def cwd():
-    print("Current working directory is " + configuration["_cwd"])
+    print("Current working directory is " + _config.cwd)
     return True
 
 
 # #Garbage function for debugging
-def printupdates():
+def printfiles(files):
     # State: 0=no change, 1=updated, 2=new, 3=deleted
     state = ['No Change', 'Updated', 'New', 'Deleted']
-    if len(newfiles) > 0:
-        for c in newfiles:
-            if newfiles[c].state >= 0:
-                print('|' + c + '       |   ' + str(newfiles[c].modified) + '|\t\t' + state[newfiles[c].state])
-    else:
-        print('No state changes detected or scan not yet done.')
+    if len(files) > 0:
+        for c in files:
+            print(c + "\t\t\t|\t\t\t" +
+                  files[c].objecttype + "\t\t\t|\t\t\t" +
+                  str(files[c].size) + "\t\t\t|\t\t\t" +
+                  str(files[c].modified) + "\t\t\t|\t\t\t" +
+                  state[files[c].state] + "|")
     return True
 
 
 # #Garbage function for debugging
 def showhashed():
-    print(hashedfilename(configuration["_cwd"]))
+    print(hashedfilename(_config.cwd))
     return True
 
 
@@ -283,13 +382,11 @@ def switchplate(argument):
     sp = {
         "setdir": setdir,
         "cwd": cwd,
-        "listdirs": listdirs,
-        "scandir": scandir,
-        "printupdates": printupdates,
-        "filecompare": filecompare,
-        "savelist": savelist,
+        "history": updatehistory,
+        "scan": scan,
+        "sync": sync,
         "showlast": showlast,
-        "done": done,
+        "exit": done,
         "showhashed": showhashed
     }
     func = sp.get(argument, lambda: True)
@@ -301,11 +398,11 @@ def menu():
     clear()
     print("Available commands:")
     print('\tsetdir\t\t\t\tSet directory of content')
-    print('\tlistdirs\t\t\tList previously scanned directories')
-    print('\tscandir\t\t\t\tScan currently selected directory')
-    print('\tsavelist\t\t\tSave current scan, if available')
+    print('\tscan\t\t\t\tScan currently selected directory')
+    print('\tsync\t\t\t\tSync or resume S3 upload of currently selected directory')
+    print('\thistory\t\t\t\tList previously scanned directories')
     print('\tshowlast\t\t\tShow last scan and stats for currently selected directory')
-    print('\tdone\t\t\t\tExit\n')
+    print('\texit\t\t\t\tExit\n')
     cwd()
     return input('\nType a command above to continue:  ')
 
@@ -315,20 +412,7 @@ def menu():
 
 # ####### Go time   ###########
 
-# if errorno=2 (file not found) then make it with default values; otherwise, panic.
-try:
-    configuration = loaddict(_configfile)
-except IOError as e:
-    if e.errno == 2:
-        print("No previous config found.  Using default config.")
-    else:
-        print("Could not load config.  I/O error({0}): {1}".format(e.errno, e.strerror))
-        _ = input("Press enter to panic.")
-        quit(0)
-except:
-    print("Unforseen error loading config.")
-    _ = input("Press enter to panic.")
-    quit(0)
+_config.load()
 
 # Show menu until selection is made, execute selection, then save config updates.
 # Exits when a function returns false, e.g. the done() function.
@@ -336,11 +420,7 @@ b = True
 while b is True:
     select = menu().lower()
     b = switchplate(select)
-    try:
-        savedict(_configfile, configuration)
-    except:
-        print("Could not save config.  Check directory permissions on " + str(os.path.abspath(os.getcwd())))
 
-
+_config.save()
 # #######  Dunzo  ##############
 
