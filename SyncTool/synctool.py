@@ -1,7 +1,10 @@
 import os
 import hashlib
 import _pickle as cpickle
+import re
 import sqlite3
+import boto3
+from boto3 import exceptions
 from platform import system
 
 print('Sup dudes')
@@ -15,6 +18,10 @@ print('Sup dudes')
 class Config:
     def __init__(self):
         self.cwd = os.path.abspath(os.getcwd())
+        self.accesskey = None
+        self.secretkey = None
+        self.s3region = None
+        self.s3user = None
         self.history = {}
 
     def load(self):
@@ -22,6 +29,10 @@ class Config:
             with open(_configfile, 'rb') as f:
                 d = cpickle.load(f)
                 self.cwd = d["cwd"]
+                self.accesskey = d["ak"]
+                self.secretkey = d["sk"]
+                self.s3region = d["s3region"]
+                self.s3user = d["s3user"]
                 self.history = d["history"]
         except IOError as e:
             if e.errno == 2:
@@ -29,31 +40,50 @@ class Config:
                 self.save()
             else:
                 print("Using default config.  Could not load config.  I/O error({0}): {1}".format(e.errno, e.strerror))
-        return self
+        except (KeyError, EOFError):
+            print("Config corrupt or missing values.  Resetting to default.")
+            self.reset()
+            self.save()
 
     def save(self):
         try:
             with open(_configfile, 'wb') as f:
                 d = {
                     "cwd": self.cwd,
+                    "ak": self.accesskey,
+                    "sk": self.secretkey,
+                    "s3region": self.s3region,
+                    "s3user": self.s3user,
                     "history": self.history
                 }
                 cpickle.dump(d, f, protocol=3)
         except IOError as e:
             print("Unable to save " + _configfile + ": I/O error({0}): {1}".format(e.errno, e.strerror))
-        # except:  # handle other exceptions such as attribute errors
-        #   print("Unable to save " + _configfile + ": ", sys.exc_info()[0])
 
     def reset(self):
         self.__init__()
+
+    def s3path(self) -> str:
+        return "client/%s/" % self.s3user
+
+    def s3bucket(self) -> str:
+        return "blackboard-learn-data-transfer-%s" % self.s3region
+
+    def print(self):
+        print("CWD: %s" % self.cwd)
+        print("Access Key: %s" % self.accesskey)
+        print("Secret Key: %s" % self.secretkey)
+        print("S3 Path: %s" % self.s3path)
+        print("History: %s" % self.history)
 
 
 # Setting up file class for each file/dir on disk
 # State: 0=no change, 1=updated, 2=new, 3=deleted
 class File:
-    def __init__(self, name, parent, objecttype, size, modified=None, state=2):
+    def __init__(self, name, parent, s3path, objecttype, size, modified=None, state=2):
         self.name = name
         self.parent = parent
+        self.s3path = s3path
         self.objecttype = objecttype
         self.size = size
         if modified is not None:
@@ -81,15 +111,17 @@ oldfiles = {}
 # Recursive generator for getting all files and directories under a path
 # Pass the path under which you want to list all files/dirs
 # Returns objects of class File
-def files(path):
+def files(path: str, basedir: str):
     if path:
         for p in os.listdir(path):
             fullpath = os.path.join(path, p)
+            s3path = fullpath.replace(basedir, basedir.rsplit('\\', 1)[-1])
+            s3path = s3path.replace("\\", "/")
             if os.path.isdir(fullpath):
-                yield File(p, path, 'DIR', os.path.getsize(fullpath), os.path.getmtime(fullpath))
-                yield from files(fullpath)
+                yield File(p, path, s3path, 'DIR', os.path.getsize(fullpath), os.path.getmtime(fullpath))
+                yield from files(fullpath, basedir)
             else:
-                yield File(p, path, 'FILE', os.path.getsize(fullpath), os.path.getmtime(fullpath))
+                yield File(p, path, s3path, 'FILE', os.path.getsize(fullpath), os.path.getmtime(fullpath))
 
 # ####### Function Defs ###########
 
@@ -108,6 +140,38 @@ def hashedfilename(filename):
     return str(hashlib.md5(filename.encode()).hexdigest()) + ".db"
 
 
+# #Configure AWS parameters
+def awsconfig():
+    global _config
+    regions = ("us-west-2", "us-west-1", "us-east-2", "us-east-1",
+               "ap-south-1", "ap-northeast-2", "ap-southeast-1", "ap-southeast-2",
+               "ap-northeast-1", "ca-central-1", "cn-north-1", "eu-central-1",
+               "eu-west-1", "eu-west-2", "eu-west-3", "sa-east-1", "us-gov-west-1")
+    clear()
+    ak = re.search(r"^(\w{20})$", input("Enter AWS Access Key: ").upper(), re.M)
+    while ak is None:
+        ak = re.search(r"^(\w{20})$",
+                       input("Doesn't appear to be a "
+                             "valid access key, please re-enter: ").upper(), re.M)
+    _config.accesskey = ak.group(1)
+    sk = input("Enter AWS Secret Key: ")
+    while len(sk) is not 40:
+        sk = input("Doesn't appear to be a valid secret key, please re-enter: ")
+    _config.secretkey = sk
+    region = input("Enter AWS region: ").lower()
+    while region not in regions:
+        region = input("Doesn't appear to be a valid AWS region, please re-enter: ")
+    _config.s3region = region
+    user = re.search(r"^(\d{6}-[\w|-]+)$", input("Enter AWS User Name: ").lower(), re.M)
+    while user is None:
+        user = re.search(r"^(\d{6}-[\w|-]+)$",
+                         input("Doesn't appear to be a "
+                               "valid AWS User Name, please re-enter: ").lower(), re.M)
+    _config.s3user = user.group(1)
+    _config.save()
+    return True
+
+
 # #Open DB for read/write, returns connection object, None if fails
 def opendb(filename):
     if os.path.isfile(filename):
@@ -124,6 +188,7 @@ def opendb(filename):
                       fullpath TEXT PRIMARY KEY,
                       name TEXT,
                       parent TEXT,
+                      s3path TEXT,
                       type TEXT,
                       size REAL,
                       modified REAL,
@@ -137,14 +202,14 @@ def opendb(filename):
 
 # #Insert, update, or delete file from DB
 def filetodb(f: File, connection: sqlite3.Connection):
-    modes = ["UPDATE files set name=?, parent=?, type=?, size=?, modified=?, state=? where fullpath=?",
-             "UPDATE files set name=?, parent=?, type=?, size=?, modified=?, state=? where fullpath=?",
-             "INSERT INTO files (name, parent, type, size, modified, state, fullpath) " +
-             "values(?,?,?,?,?,?,?)",
+    modes = ["UPDATE files set name=?, parent=?, s3path=?, type=?, size=?, modified=?, state=? where fullpath=?",
+             "UPDATE files set name=?, parent=?, s3path=?, type=?, size=?, modified=?, state=? where fullpath=?",
+             "INSERT INTO files (name, parent, s3path, type, size, modified, state, fullpath) " +
+             "values(?,?,?,?,?,?,?,?)",
              "DELETE FROM files where fullpath=?"]
     if f.state < 3:
         connection.cursor().execute(modes[f.state],
-                                    (f.name, f.parent, f.objecttype, f.size, f.modified, f.state, f.fullpath))
+                                    (f.name, f.parent, f.s3path, f.objecttype, f.size, f.modified, f.state, f.fullpath))
     elif f.state == 3:
         connection.cursor().execute(modes[f.state],
                                     (f.fullpath,))
@@ -154,28 +219,28 @@ def filetodb(f: File, connection: sqlite3.Connection):
 def dbtodict(connection: sqlite3.Connection, mode="all"):
     d = {}
     if mode == "updates":
-        query = '''SELECT fullpath, name, parent, type, size, modified, state
+        query = '''SELECT fullpath, name, parent, s3path, type, size, modified, state
             from files WHERE state > 0'''
     else:
-        query = '''SELECT fullpath, name, parent, type, size, modified, state
+        query = '''SELECT fullpath, name, parent, s3path, type, size, modified, state
             from files'''
     for row in connection.cursor().execute(query):
-        d[row[0]] = File(row[1], row[2], row[3], row[4], row[5], row[6])
+        d[row[0]] = File(row[1], row[2], row[3], row[4], row[5], row[6], row[7])
     return d
 
 
 # #Set directory to scan
 def setdir():
     global _config
-    b = True
-    while b:
+    valid = True
+    while valid:
         directory = input("Enter path to recursively search, c to cancel:  ")
         if directory == "c":
-            b = False
+            valid = False
         elif os.path.isdir(directory):
             _config.cwd = os.path.abspath(directory)
             _config.save()
-            b = False
+            valid = False
         else:
             print(directory + " doesn't appear to be a directory or access is denied.")
     return True
@@ -184,12 +249,15 @@ def setdir():
 # #List past directories
 def updatehistory():
     global _config
+    todelete = []
     print("Previous Scans:")
     for k, v in _config.history.items():
-        if os.path.isfile(k):
-            del _config.history[k]
+        if os.path.isfile(v):
+            print("%s :    ID - %s" % (k, v))
         else:
-            print("%s :    ID - %s" % (v, k))
+            todelete.append(k)
+    for k in todelete:
+        del _config.history[k]
     _config.save()
     _ = input("Press any key to continue")
     return True
@@ -202,16 +270,12 @@ def scan():
         print("Open existing db for current working directory...")
         with opendb(hashedfilename(_config.cwd)) as dbconn:
             tempold = dbtodict(dbconn)
-            input("Hit enter to continue")
             # run generator into newfiles
             print("Generating list of files under current working directory...")
             tempnew = scantodict(_config.cwd)
-            input("Hit enter to continue")
             # run file compare on newfiles, remove all nochanges
-            print("Scanning for changes...")
             tempnew = filecompare(tempold, tempnew)
             printfiles(tempnew)
-            input("Hit enter to continue")
             # iterate filetodb on each newfiles, commit each time (or every 10 maybe?) test commit each time vs at end
             print("Saving updates...")
             for f in tempnew:
@@ -219,8 +283,6 @@ def scan():
             dbconn.commit()
             _config.history[_config.cwd] = hashedfilename(_config.cwd)
             _config.save()
-            input("Hit enter to continue")
-            # close connection
             print("Scan complete.  Run upload to begin uploading to S3.")
             del tempnew
             del tempold
@@ -228,11 +290,11 @@ def scan():
 
 
 # #Scan selected directory
-def scantodict(cwd) -> dict:
+def scantodict(directory) -> dict:
     # #Init generator
     tempfiles = {}
-    if os.path.isdir(cwd):
-        getfiles = files(cwd)
+    if os.path.isdir(directory):
+        getfiles = files(directory, _config.cwd)
         # #Run generator with handbrake, fill dict with full path as key, file objects as values, then delete generator
         try:
             for x in range(0, _handbrake):
@@ -244,7 +306,7 @@ def scantodict(cwd) -> dict:
         finally:
             del getfiles
     else:
-        print(cwd + " either is not a directory, doesn't exist, or denies access.")
+        print(directory + " either is not a directory, doesn't exist, or denies access.")
     return tempfiles
 
 
@@ -293,43 +355,71 @@ def showlast():
 
 
 # #Sync a file to S3
-def syncfile(file: File) -> bool:
+def syncfile(file: File, s3conn) -> bool:
     # State: 0=no change, 1=updated, 2=new, 3=deleted
-    # If updated, overwrite
-    if file.state == 1:
-        print("Updated %s" % file.fullpath)
-    # If new, upload
-    elif file.state == 2:
-        print("Added %s" % file.fullpath)
-    # If deleted, delete from S3
+    filename = _config.s3path() + file.s3path
+    if file.objecttype == "DIR":
+        filename = filename + "/"
+    if file.state in (1, 2):
+        r = False
+        if file.objecttype == "DIR":
+            try:
+                s3conn.meta.client.put_object(Bucket=_config.s3bucket(), Key=filename)
+                r = True
+            except s3conn.meta.client.exceptions.ClientError as e:
+                print(e)
+        else:
+            try:
+                s3conn.meta.client.upload_file(file.fullpath, _config.s3bucket(), filename)
+                r = True
+            except boto3.exceptions.S3UploadFailedError as e:
+                print(e)
+        return r
     elif file.state == 3:
-        print("Deleted %s" % file.fullpath)
+        try:
+            s3conn.meta.client.delete_object(Bucket=_config.s3bucket(), Key=filename)
+            return True
+        except s3conn.meta.client.exceptions.ClientError as e:
+            print(e)
+            return False
     else:
         return False
-    return True
 
 
 # #Run sync for all files in DB, update if sync'd
 def sync():
     global _config
-    if os.path.isdir(_config.cwd):
-        print("Open existing db for current working directory...")
-        with opendb(hashedfilename(_config.cwd)) as dbconn:
-            files = dbtodict(dbconn, "updates")
-            input("Hit enter to continue")
-            print("Updating S3:")
-            for f in files:
-                print("Processing %s:" % f)
-                if syncfile(files[f]):
-                    files[f].state = 0
-                    filetodb(files[f], dbconn)
-                    dbconn.commit()
-                else:
-                    print("File %s not uploaded." % f)
-            input("Hit enter to continue")
-            # close connection
-            print("Sync to S3 complete.")
-            del files
+    if (
+        _config.accesskey is not None and
+        _config.secretkey is not None and
+        _config.s3region is not None and
+        _config.s3user is not None
+    ):
+        if os.path.isdir(_config.cwd):
+            s3 = boto3.Session(
+                aws_access_key_id=_config.accesskey,
+                aws_secret_access_key=_config.secretkey,
+            ).resource('s3')
+            print("Open existing db for current working directory...")
+            with opendb(hashedfilename(_config.cwd)) as dbconn:
+                flist = dbtodict(dbconn, "updates")
+                input("Hit enter to continue")
+                print("Updating S3:")
+                for f in flist:
+                    print("Processing %s:" % f)
+                    if syncfile(flist[f], s3):
+                        flist[f].state = 0
+                        filetodb(flist[f], dbconn)
+                        dbconn.commit()
+                    else:
+                        print("File %s not uploaded." % f)
+                input("Hit enter to continue")
+                # close connection
+                print("Sync to S3 complete.")
+                del flist
+    else:
+        print("Misconfiguration or missing parameters in AWS Settings, "
+              "please run awsconfig to configure AWS settings.")
     return True
 
 # #S3 verify function goes here
@@ -353,16 +443,17 @@ def cwd():
 
 
 # #Garbage function for debugging
-def printfiles(files):
+def printfiles(listtoprint):
     # State: 0=no change, 1=updated, 2=new, 3=deleted
     state = ['No Change', 'Updated', 'New', 'Deleted']
-    if len(files) > 0:
-        for c in files:
+    if len(listtoprint) > 0:
+        for c in listtoprint:
             print(c + "\t\t\t|\t\t\t" +
-                  files[c].objecttype + "\t\t\t|\t\t\t" +
-                  str(files[c].size) + "\t\t\t|\t\t\t" +
-                  str(files[c].modified) + "\t\t\t|\t\t\t" +
-                  state[files[c].state] + "|")
+                  listtoprint[c].objecttype + "\t\t\t|\t\t\t" +
+                  listtoprint[c].s3path + "\t\t\t|\t\t\t" +
+                  str(listtoprint[c].size) + "\t\t\t|\t\t\t" +
+                  str(listtoprint[c].modified) + "\t\t\t|\t\t\t" +
+                  state[listtoprint[c].state] + "|")
     return True
 
 
@@ -381,13 +472,12 @@ def done():
 def switchplate(argument):
     sp = {
         "setdir": setdir,
-        "cwd": cwd,
+        "awsconfig": awsconfig,
         "history": updatehistory,
         "scan": scan,
         "sync": sync,
         "showlast": showlast,
-        "exit": done,
-        "showhashed": showhashed
+        "exit": done
     }
     func = sp.get(argument, lambda: True)
     return func()
@@ -398,6 +488,7 @@ def menu():
     clear()
     print("Available commands:")
     print('\tsetdir\t\t\t\tSet directory of content')
+    print('\tawsconfig\t\t\tConfigure AWS keys and path')
     print('\tscan\t\t\t\tScan currently selected directory')
     print('\tsync\t\t\t\tSync or resume S3 upload of currently selected directory')
     print('\thistory\t\t\t\tList previously scanned directories')
@@ -407,10 +498,8 @@ def menu():
     return input('\nType a command above to continue:  ')
 
 
-# #######  Inits   ###########
-
-
 # ####### Go time   ###########
+
 
 _config.load()
 
@@ -422,5 +511,6 @@ while b is True:
     b = switchplate(select)
 
 _config.save()
-# #######  Dunzo  ##############
 
+
+# #######  Dunzo  ##############
