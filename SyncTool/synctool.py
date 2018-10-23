@@ -4,12 +4,11 @@ import _pickle as cpickle
 import re
 import sqlite3
 import boto3
+import logging
+from logging.handlers import RotatingFileHandler
 from boto3 import exceptions
 from platform import system
-
-print('Sup dudes')
-
-# #######  Globals and user vars  ##########
+from sys import stdout
 
 
 # ####### Class Defs ###########
@@ -36,12 +35,13 @@ class Config:
                 self.history = d["history"]
         except IOError as e:
             if e.errno == 2:
-                print("No previous config found.  Using default config.")
+                logging.info("No previous config found.  Using default config.")
                 self.save()
             else:
-                print("Using default config.  Could not load config.  I/O error({0}): {1}".format(e.errno, e.strerror))
+                logging.warning("Using default config.  Could not load config.  "
+                                "I/O error({0}): {1}".format(e.errno, e.strerror))
         except (KeyError, EOFError):
-            print("Config corrupt or missing values.  Resetting to default.")
+            logging.warning("Config corrupt or missing values.  Resetting to default.")
             self.reset()
             self.save()
 
@@ -57,8 +57,9 @@ class Config:
                     "history": self.history
                 }
                 cpickle.dump(d, f, protocol=3)
+                logging.debug("Config saved.")
         except IOError as e:
-            print("Unable to save " + _configfile + ": I/O error({0}): {1}".format(e.errno, e.strerror))
+            logging.error("Unable to save {0}: I/O error({1}): {2}".format(_configfile, e.errno, e.strerror))
 
     def reset(self):
         self.__init__()
@@ -69,12 +70,18 @@ class Config:
     def s3bucket(self) -> str:
         return "blackboard-learn-data-transfer-%s" % self.s3region
 
-    def print(self):
-        print("CWD: %s" % self.cwd)
-        print("Access Key: %s" % self.accesskey)
-        print("Secret Key: %s" % self.secretkey)
-        print("S3 Path: %s" % self.s3path)
-        print("History: %s" % self.history)
+    def logawsconfig(self):
+        ak, sk, user, bucket = "None", "None", "None", "None"
+        if self.accesskey:
+            ak = "%s...%s" % (self.accesskey[0], self.accesskey[-1])
+        if self.secretkey:
+            sk = "%s...%s" % (self.secretkey[0], self.secretkey[-1])
+        if self.s3user:
+            user = self.s3user
+        if self.s3region:
+            bucket = self.s3bucket()
+        logging.debug("AWSCONFIG: Accesskey={0}, Secretkey={1}, User={2}, Bucket={3}"
+                      .format(ak, sk, user, bucket))
 
 
 # Setting up file class for each file/dir on disk
@@ -95,14 +102,12 @@ class File:
 # #######   Globals  ###########
 
 
+_logpath = os.path.join('logs', 'synctool.log')
 _configfile = "config.db"
 _config = Config()
 
 # #let's not go off the handle until we're prod ready.  limit 100k results.
 _handbrake = 100000
-
-newfiles = {}
-oldfiles = {}
 
 
 # ####### Generators ###########
@@ -126,6 +131,28 @@ def files(path: str, basedir: str):
 # ####### Function Defs ###########
 
 
+# #Create Logger
+def create_logger(path):
+    try:
+        if not os.path.exists('logs'):
+            os.makedirs('logs')
+        logfilehandler = RotatingFileHandler(path, maxBytes=1048576 * 10, backupCount=5)
+        logfilehandler.setFormatter(logging.Formatter(
+            fmt='%(asctime)s: %(levelname)s:\t%(message)s', datefmt='%m/%d/%Y %H:%M:%S'))
+        logfilehandler.setLevel(logging.DEBUG)
+        streamhandler = logging.StreamHandler(stdout)
+        streamhandler.setFormatter(logging.Formatter(fmt='%(message)s'))
+        streamhandler.setLevel(logging.INFO)
+        logging.basicConfig(
+            level=logging.DEBUG,
+            handlers=[logfilehandler,
+                      streamhandler
+                      ])
+    except IOError as e:
+        print("Could not create log at %s, ERROR: %s" % (path, e.strerror))
+        exit(-1)
+
+
 # #Get human-readable size on disk
 def sizeof_fmt(num, suffix='B'):
     for unit in ['', 'K', 'M', 'G', 'T', 'P', 'E', 'Z']:
@@ -133,6 +160,13 @@ def sizeof_fmt(num, suffix='B'):
             return "%3.1f%s%s" % (num, unit, suffix)
         num /= 1000.0
     return "%.1f%s%s" % (num, 'Yi', suffix)
+
+
+# #Lame progress bar
+def update_progress(progress):
+    stdout.write("\r[%s] %.2f%%" % ('#'*int(round(progress*50)), (progress*100)))
+    if (progress*100) >= 100:
+        stdout.write("\n")
 
 
 # #Return hash of a filename for saving unique dbs
@@ -168,6 +202,7 @@ def awsconfig():
                          input("Doesn't appear to be a "
                                "valid AWS User Name, please re-enter: ").lower(), re.M)
     _config.s3user = user.group(1)
+    _config.logawsconfig()
     _config.save()
     return True
 
@@ -178,7 +213,7 @@ def opendb(filename):
         try:
             return sqlite3.connect(filename)
         except sqlite3.DatabaseError as e:
-            print("Could not open existing database: " + str(e))
+            logging.error("Could not open existing database: %s" % e)
             return None
     else:
         try:
@@ -196,7 +231,7 @@ def opendb(filename):
             connection.commit()
             return connection
         except sqlite3.DatabaseError as e:
-            print("Could not create database: " + str(e))
+            logging.error("Could not create database: %s" % e)
             return None
 
 
@@ -239,6 +274,7 @@ def setdir():
             valid = False
         elif os.path.isdir(directory):
             _config.cwd = os.path.abspath(directory)
+            logging.debug("Current working directory changed to %s" % _config.cwd)
             _config.save()
             valid = False
         else:
@@ -267,23 +303,27 @@ def updatehistory():
 def scan():
     global _config
     if os.path.isdir(_config.cwd):
-        print("Open existing db for current working directory...")
+        logging.debug("Open existing db for %s" % _config.cwd)
         with opendb(hashedfilename(_config.cwd)) as dbconn:
             tempold = dbtodict(dbconn)
-            # run generator into newfiles
-            print("Generating list of files under current working directory...")
+            # run generator into file dict
+            logging.info("Generating list of files under current working directory...")
             tempnew = scantodict(_config.cwd)
-            # run file compare on newfiles, remove all nochanges
+            # run file compare on file dict, remove all nochanges
             tempnew = filecompare(tempold, tempnew)
-            printfiles(tempnew)
-            # iterate filetodb on each newfiles, commit each time (or every 10 maybe?) test commit each time vs at end
-            print("Saving updates...")
+            # iterate filetodb on each file dict, commit each time (or every 10 maybe?) test commit each time vs at end
+            logging.info("Saving updates...")
+            total = len(tempnew)
+            progress = 0
             for f in tempnew:
                 filetodb(tempnew[f], dbconn)
+                progress += 1
+                update_progress(progress/total)
             dbconn.commit()
+            logging.debug("Scan of %s saved in %s" % (_config.cwd, hashedfilename(_config.cwd)))
             _config.history[_config.cwd] = hashedfilename(_config.cwd)
             _config.save()
-            print("Scan complete.  Run upload to begin uploading to S3.")
+            logging.info("Scan complete.  Run upload to begin uploading to S3.")
             del tempnew
             del tempold
     return True
@@ -293,6 +333,7 @@ def scan():
 def scantodict(directory) -> dict:
     # #Init generator
     tempfiles = {}
+    scanprog = 0
     if os.path.isdir(directory):
         getfiles = files(directory, _config.cwd)
         # #Run generator with handbrake, fill dict with full path as key, file objects as values, then delete generator
@@ -300,13 +341,14 @@ def scantodict(directory) -> dict:
             for x in range(0, _handbrake):
                 f = (next(getfiles))
                 tempfiles[f.fullpath] = f
-                print(f.fullpath + ",    " + f.objecttype + ", " + str(f.modified))
+                scanprog += 1
+                stdout.write("\r%d Objects Scanned" % scanprog)
         except StopIteration:
-            pass
+            stdout.write("\n")
         finally:
             del getfiles
     else:
-        print(directory + " either is not a directory, doesn't exist, or denies access.")
+        logging.warning("%s either is not a directory, doesn't exist, or denies access." % directory)
     return tempfiles
 
 
@@ -314,29 +356,42 @@ def scantodict(directory) -> dict:
 def filecompare(tempold: dict, tempnew: dict) -> dict:
     if len(tempold) > 0:
         if len(tempnew) > 0:
+            total = len(tempnew)
+            progress = 0
             remove = []
             # State: 0=no change, 1=updated, 2=new, 3=deleted
+            logging.info("Processing Updates...")
             for c in tempnew:
                 if c in tempold:
                     if (tempnew[c].modified > tempold[c].modified) and tempold[c].state in [0, 1]:
                         tempnew[c].state = 1
+                        logging.debug("Found Update:\t%s" % c)
                     else:
                         tempnew[c].state = 0
                         remove.append(c)
                     del (tempold[c])
                 else:
                     tempnew[c].state = 2
+                    logging.debug("Found New:\t%s" % c)
+                progress += 1
+                update_progress(progress/total)
             for c in remove:
                     del tempnew[c]
             del remove
+            logging.info("Processing Deletes...")
+            total = len(tempold)
+            progress = 0
             for c in tempold:
                 tempold[c].state = 3
                 tempnew[c] = tempold[c]
+                logging.debug("Found Delete:\t%s" % c)
+                progress += 1
+                update_progress(progress/total)
             del tempold
         else:
-            print("No files in directory.")
+            logging.info("No files in directory.")
     else:
-        print("First scan of directory.  All files will be uploaded.")
+        logging.info("First scan of directory.  All files will be uploaded.")
     return tempnew
 
 
@@ -367,20 +422,20 @@ def syncfile(file: File, s3conn) -> bool:
                 s3conn.meta.client.put_object(Bucket=_config.s3bucket(), Key=filename)
                 r = True
             except s3conn.meta.client.exceptions.ClientError as e:
-                print(e)
+                logging.warning(e)
         else:
             try:
                 s3conn.meta.client.upload_file(file.fullpath, _config.s3bucket(), filename)
                 r = True
             except boto3.exceptions.S3UploadFailedError as e:
-                print(e)
+                logging.warning(e)
         return r
     elif file.state == 3:
         try:
             s3conn.meta.client.delete_object(Bucket=_config.s3bucket(), Key=filename)
             return True
         except s3conn.meta.client.exceptions.ClientError as e:
-            print(e)
+            logging.warning(e)
             return False
     else:
         return False
@@ -396,36 +451,93 @@ def sync():
         _config.s3user is not None
     ):
         if os.path.isdir(_config.cwd):
+            _config.logawsconfig()
             s3 = boto3.Session(
                 aws_access_key_id=_config.accesskey,
                 aws_secret_access_key=_config.secretkey,
             ).resource('s3')
-            print("Open existing db for current working directory...")
+            logging.info("Open existing db for current working directory...")
             with opendb(hashedfilename(_config.cwd)) as dbconn:
                 flist = dbtodict(dbconn, "updates")
-                input("Hit enter to continue")
-                print("Updating S3:")
+                logging.info("Updating S3...")
+                total = len(flist)
+                progress = 0
                 for f in flist:
-                    print("Processing %s:" % f)
+                    logging.debug("Processing %s:" % f)
                     if syncfile(flist[f], s3):
                         flist[f].state = 0
                         filetodb(flist[f], dbconn)
                         dbconn.commit()
                     else:
-                        print("File %s not uploaded." % f)
-                input("Hit enter to continue")
+                        logging.warning("File %s not uploaded." % f)
+                    progress += 1
+                    update_progress(progress/total)
                 # close connection
-                print("Sync to S3 complete.")
+                logging.info("Sync to S3 complete.")
                 del flist
     else:
-        print("Misconfiguration or missing parameters in AWS Settings, "
-              "please run awsconfig to configure AWS settings.")
+        logging.warning("Misconfiguration or missing parameters in AWS Settings, "
+                        "please run awsconfig to configure AWS settings.")
     return True
+
 
 # #S3 verify function goes here
 # load oldfiles for _cwd
 # for each in oldfiles, check S3
 #  update oldfiles
+
+
+# #Nuke a prefix in S3 using paginated delete (very fast for large numbers of deletes
+# #Putting this here for later: to filter objects by tag, must use JMESPath expressions:
+# #https://boto3.amazonaws.com/v1/documentation/api/latest/guide/paginators.html#filtering-results
+def s3delete() -> bool:
+    if (
+            _config.accesskey is not None and
+            _config.secretkey is not None and
+            _config.s3region is not None and
+            _config.s3user is not None
+    ):
+        _config.logawsconfig()
+        s3conn = boto3.Session(
+            aws_access_key_id=_config.accesskey,
+            aws_secret_access_key=_config.secretkey,
+        ).resource('s3')
+        client = s3conn.meta.client
+        paginator = client.get_paginator('list_objects_v2')
+        deleted = 0
+        path = None
+        while path is None:
+            path = input("Enter path in S3 to delete: ")
+            path = re.search("^([\w+/?]+)$", path, re.M)
+        path = _config.s3path() + path.group(1)
+        yn = input("Are you absolutely sure you want to delete "
+                   "the following path and all sub-objects? (y/n)\n%s:   " % path)
+        if yn.lower() == "y":
+            logging.info("Deleting %s..." % path)
+            try:
+                pages = paginator.paginate(Bucket=_config.s3bucket(), Prefix=path)
+                delete_us = dict(Objects=[])
+                for item in pages.search('Contents'):
+                    delete_us['Objects'].append(dict(Key=item['Key']))
+                    deleted += 1
+                    # flush once aws limit reached
+                    if len(delete_us['Objects']) >= 1000:
+                        client.delete_objects(Bucket=_config.s3bucket(), Delete=delete_us)
+                        delete_us = dict(Objects=[])
+                        logging.info("%d objects deleted." % deleted)
+
+                # flush rest
+                if len(delete_us['Objects']):
+                    client.delete_objects(Bucket=_config.s3bucket(), Delete=delete_us)
+                    _ = input("%d objects deleted.  Hit enter to continue." % deleted)
+            except client.exceptions.ClientError as e:
+                logging.warning(e)
+        else:
+            _ = input("Delete canceled. Hit enter to return to menu.")
+    else:
+        logging.warning("Misconfiguration or missing parameters in AWS Settings, "
+                        "please run awsconfig to configure AWS settings.")
+    return True
 
 
 # #Handy one-shot for clearing CLI
@@ -448,18 +560,9 @@ def printfiles(listtoprint):
     state = ['No Change', 'Updated', 'New', 'Deleted']
     if len(listtoprint) > 0:
         for c in listtoprint:
-            print(c + "\t\t\t|\t\t\t" +
-                  listtoprint[c].objecttype + "\t\t\t|\t\t\t" +
-                  listtoprint[c].s3path + "\t\t\t|\t\t\t" +
-                  str(listtoprint[c].size) + "\t\t\t|\t\t\t" +
-                  str(listtoprint[c].modified) + "\t\t\t|\t\t\t" +
-                  state[listtoprint[c].state] + "|")
-    return True
-
-
-# #Garbage function for debugging
-def showhashed():
-    print(hashedfilename(_config.cwd))
+            print(c + "\t|\t" +
+                  sizeof_fmt(listtoprint[c].size) + "\t|\t" +
+                  state[listtoprint[c].state])
     return True
 
 
@@ -477,6 +580,7 @@ def switchplate(argument):
         "scan": scan,
         "sync": sync,
         "showlast": showlast,
+        "delete": s3delete,
         "exit": done
     }
     func = sp.get(argument, lambda: True)
@@ -492,25 +596,28 @@ def menu():
     print('\tscan\t\t\t\tScan currently selected directory')
     print('\tsync\t\t\t\tSync or resume S3 upload of currently selected directory')
     print('\thistory\t\t\t\tList previously scanned directories')
-    print('\tshowlast\t\t\tShow last scan and stats for currently selected directory')
     print('\texit\t\t\t\tExit\n')
     cwd()
     return input('\nType a command above to continue:  ')
 
 
 # ####### Go time   ###########
-
-
-_config.load()
-
-# Show menu until selection is made, execute selection, then save config updates.
-# Exits when a function returns false, e.g. the done() function.
-b = True
-while b is True:
-    select = menu().lower()
-    b = switchplate(select)
-
-_config.save()
+def main():
+    create_logger(_logpath)
+    logging.debug("Logging started.")
+    _config.load()
+    logging.debug("Config loaded.")
+    # Show menu until selection is made, execute selection, then save config updates.
+    # Exits when a function returns false, e.g. the done() function.
+    b = True
+    while b is True:
+        select = menu().lower()
+        b = switchplate(select)
+    _config.save()
+    logging.debug("Config saved.")
+    logging.debug("Synctool finished successfully.")
 
 
 # #######  Dunzo  ##############
+if __name__ == "__main__":
+    main()
