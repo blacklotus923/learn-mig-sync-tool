@@ -205,7 +205,7 @@ def awsconfig():
     _config.s3user = user.group(1)
     _config.logawsconfig()
     _config.save()
-    _ = input("AWS Config saved.  Press enter to continue.")
+    _ = input("AWS Config saved.  Hit enter to continue.")
     return True
 
 
@@ -297,7 +297,7 @@ def updatehistory():
     for k in todelete:
         del _config.history[k]
     _config.save()
-    _ = input("Press enter to continue.")
+    _ = input("Hit enter to continue.")
     return True
 
 
@@ -328,7 +328,7 @@ def scan():
             logging.info("Scan complete.  Run upload to begin uploading to S3.")
             del tempnew
             del tempold
-    _ = input("Press enter to continue.")
+    _ = input("Hit enter to continue.")
     return True
 
 
@@ -408,7 +408,7 @@ def showlast():
             del tempfiles
     else:
         logging.info("%s has no previous scan data or DB file is inaccessible." % _config.cwd)
-    _ = input("Press enter to continue.")
+    _ = input("Hit enter to continue.")
     return True
 
 
@@ -481,7 +481,7 @@ def sync():
     else:
         logging.warning("Misconfiguration or missing parameters in AWS Settings, "
                         "please run awsconfig to configure AWS settings.")
-    _ = input("Press enter to continue.")
+    _ = input("Hit enter to continue.")
     return True
 
 
@@ -533,7 +533,7 @@ def s3delete() -> bool:
                 # flush rest
                 if len(delete_us['Objects']):
                     client.delete_objects(Bucket=_config.s3bucket(), Delete=delete_us)
-                    _ = input("%d objects deleted.  Hit enter to continue." % deleted)
+                    logging.info("%d objects deleted." % deleted)
             except client.exceptions.ClientError as e:
                 logging.warning(e)
             except TypeError as e:
@@ -543,7 +543,7 @@ def s3delete() -> bool:
     else:
         logging.warning("Misconfiguration or missing parameters in AWS Settings, "
                         "please run awsconfig to configure AWS settings.")
-    _ = input("Press enter to continue.")
+    _ = input("Hit enter to continue.")
     return True
 
 
