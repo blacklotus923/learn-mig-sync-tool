@@ -33,6 +33,7 @@ class Config:
                 self.s3region = d["s3region"]
                 self.s3user = d["s3user"]
                 self.history = d["history"]
+                logging.debug("Config Loaded.")
         except IOError as e:
             if e.errno == 2:
                 logging.info("No previous config found.  Using default config.")
@@ -97,7 +98,7 @@ class File:
             self.modified = modified
         if state is not None:
             self.state = state
-        self.fullpath = parent + '\\' + name
+        self.fullpath = os.path.join(parent, name)
 
 # #######   Globals  ###########
 
@@ -120,7 +121,8 @@ def files(path: str, basedir: str):
     if path:
         for p in os.listdir(path):
             fullpath = os.path.join(path, p)
-            s3path = fullpath.replace(basedir, basedir.rsplit('\\', 1)[-1])
+            temppath = fullpath.replace("/", "\\")
+            s3path = temppath.replace(basedir, basedir.rsplit('\\', 1)[-1])
             s3path = s3path.replace("\\", "/")
             if os.path.isdir(fullpath):
                 yield File(p, path, s3path, 'DIR', os.path.getsize(fullpath), os.path.getmtime(fullpath))
@@ -181,7 +183,6 @@ def awsconfig():
                "ap-south-1", "ap-northeast-2", "ap-southeast-1", "ap-southeast-2",
                "ap-northeast-1", "ca-central-1", "cn-north-1", "eu-central-1",
                "eu-west-1", "eu-west-2", "eu-west-3", "sa-east-1", "us-gov-west-1")
-    clear()
     ak = re.search(r"^(\w{20})$", input("Enter AWS Access Key: ").upper(), re.M)
     while ak is None:
         ak = re.search(r"^(\w{20})$",
@@ -204,6 +205,7 @@ def awsconfig():
     _config.s3user = user.group(1)
     _config.logawsconfig()
     _config.save()
+    _ = input("AWS Config saved.  Press enter to continue.")
     return True
 
 
@@ -295,7 +297,7 @@ def updatehistory():
     for k in todelete:
         del _config.history[k]
     _config.save()
-    _ = input("Press any key to continue")
+    _ = input("Press enter to continue.")
     return True
 
 
@@ -326,6 +328,7 @@ def scan():
             logging.info("Scan complete.  Run upload to begin uploading to S3.")
             del tempnew
             del tempold
+    _ = input("Press enter to continue.")
     return True
 
 
@@ -403,10 +406,10 @@ def showlast():
             print('Loaded ' + _config.cwd)
             printfiles(tempfiles)
             del tempfiles
-        return True
     else:
-        input("%s has no previous scan data or DB file is inaccessible. Hit enter to continue." % _config.cwd)
-        return True
+        logging.info("%s has no previous scan data or DB file is inaccessible." % _config.cwd)
+    _ = input("Press enter to continue.")
+    return True
 
 
 # #Sync a file to S3
@@ -478,6 +481,7 @@ def sync():
     else:
         logging.warning("Misconfiguration or missing parameters in AWS Settings, "
                         "please run awsconfig to configure AWS settings.")
+    _ = input("Press enter to continue.")
     return True
 
 
@@ -532,11 +536,14 @@ def s3delete() -> bool:
                     _ = input("%d objects deleted.  Hit enter to continue." % deleted)
             except client.exceptions.ClientError as e:
                 logging.warning(e)
+            except TypeError as e:
+                logging.info("Directory %s does not exist in S3 or nothing to delete." % path)
         else:
-            _ = input("Delete canceled. Hit enter to return to menu.")
+            print("Delete canceled.")
     else:
         logging.warning("Misconfiguration or missing parameters in AWS Settings, "
                         "please run awsconfig to configure AWS settings.")
+    _ = input("Press enter to continue.")
     return True
 
 
@@ -546,12 +553,6 @@ def clear():
         _ = os.system('cls')
     else:
         _ = os.system('clear')
-
-
-# #Garbage function for debugging
-def cwd():
-    print("Current working directory is " + _config.cwd)
-    return True
 
 
 # #Garbage function for debugging
@@ -597,7 +598,7 @@ def menu():
     print('\tsync\t\t\t\tSync or resume S3 upload of currently selected directory')
     print('\thistory\t\t\t\tList previously scanned directories')
     print('\texit\t\t\t\tExit\n')
-    cwd()
+    print("Current working directory is " + _config.cwd)
     return input('\nType a command above to continue:  ')
 
 
@@ -606,15 +607,14 @@ def main():
     create_logger(_logpath)
     logging.debug("Logging started.")
     _config.load()
-    logging.debug("Config loaded.")
     # Show menu until selection is made, execute selection, then save config updates.
     # Exits when a function returns false, e.g. the done() function.
     b = True
     while b is True:
         select = menu().lower()
+        clear()
         b = switchplate(select)
     _config.save()
-    logging.debug("Config saved.")
     logging.debug("Synctool finished successfully.")
 
 
