@@ -341,14 +341,15 @@ def scantodict(directory) -> dict:
         getfiles = files(directory, _config.cwd)
         # #Run generator with handbrake, fill dict with full path as key, file objects as values, then delete generator
         try:
-            for x in range(0, _handbrake):
+            while True:
                 f = (next(getfiles))
                 tempfiles[f.fullpath] = f
                 scanprog += 1
                 stdout.write("\r%d Objects Scanned" % scanprog)
         except StopIteration:
-            stdout.write("\n")
+            pass
         finally:
+            stdout.write("\n")
             del getfiles
     else:
         logging.warning("%s either is not a directory, doesn't exist, or denies access." % directory)
