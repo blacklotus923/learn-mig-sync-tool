@@ -121,9 +121,9 @@ def files(path: str, basedir: str):
     if path:
         for p in os.listdir(path):
             fullpath = os.path.join(path, p)
-            temppath = fullpath.replace("/", "\\")
-            s3path = temppath.replace(basedir, basedir.rsplit('\\', 1)[-1])
-            s3path = s3path.replace("\\", "/")
+            ospath = fullpath.replace("\\", "/")
+            osbase = basedir.replace("\\", "/")
+            s3path = ospath.replace(osbase, osbase.rsplit('/', 1)[-1])
             if os.path.isdir(fullpath):
                 yield File(p, path, s3path, 'DIR', os.path.getsize(fullpath), os.path.getmtime(fullpath))
                 yield from files(fullpath, basedir)
@@ -307,7 +307,7 @@ def updatehistory():
 def scan():
     global _config
     if os.path.isdir(_config.cwd):
-        logging.debug("Open existing db for %s" % _config.cwd)
+        logging.info("Opening existing db for %s" % _config.cwd)
         with opendb(hashedfilename(_config.cwd)) as dbconn:
             tempold = dbtodict(dbconn)
             # run generator into file dict
@@ -541,11 +541,13 @@ def s3delete() -> bool:
                     if len(delete_us['Objects']) >= 1000:
                         client.delete_objects(Bucket=_config.s3bucket(), Delete=delete_us)
                         delete_us = dict(Objects=[])
+                        stdout.write("\r")
                         logging.info("%d objects deleted." % deleted)
 
                 # flush rest
                 if len(delete_us['Objects']):
                     client.delete_objects(Bucket=_config.s3bucket(), Delete=delete_us)
+                    stdout.write("\r")
                     logging.info("%d objects deleted." % deleted)
             except client.exceptions.ClientError as e:
                 logging.warning(e)
