@@ -166,7 +166,8 @@ def sizeof_fmt(num, suffix='B'):
 
 # #Lame progress bar
 def update_progress(progress):
-    stdout.write("\r[%s] %.2f%%" % ('#'*int(round(progress*50)), (progress*100)))
+    bar = int(round(progress*50))
+    stdout.write("\r %.2f%% [%s%s]" % ((progress*100), '#'*bar, ' '*(50-bar)))
     if (progress*100) >= 100:
         stdout.write("\n")
 
@@ -243,11 +244,12 @@ def filetodb(f: File, connection: sqlite3.Connection):
              "UPDATE files set name=?, parent=?, s3path=?, type=?, size=?, modified=?, state=? where fullpath=?",
              "INSERT INTO files (name, parent, s3path, type, size, modified, state, fullpath) " +
              "values(?,?,?,?,?,?,?,?)",
+             "UPDATE files set name=?, parent=?, s3path=?, type=?, size=?, modified=?, state=? where fullpath=?",
              "DELETE FROM files where fullpath=?"]
-    if f.state < 3:
+    if f.state <= 3:
         connection.cursor().execute(modes[f.state],
                                     (f.name, f.parent, f.s3path, f.objecttype, f.size, f.modified, f.state, f.fullpath))
-    elif f.state == 3:
+    elif f.state == 4:
         connection.cursor().execute(modes[f.state],
                                     (f.fullpath,))
 
@@ -367,7 +369,7 @@ def filecompare(tempold: dict, tempnew: dict) -> dict:
             logging.info("Processing Updates...")
             for c in tempnew:
                 if c in tempold:
-                    if (tempnew[c].modified > tempold[c].modified) and tempold[c].state in [0, 1]:
+                    if (tempnew[c].modified > tempold[c].modified) and tempold[c].state in [0, 1, 3]:
                         tempnew[c].state = 1
                         logging.debug("Found Update:\t%s" % c)
                     else:
@@ -386,7 +388,10 @@ def filecompare(tempold: dict, tempnew: dict) -> dict:
             total = len(tempold)
             progress = 0
             for c in tempold:
-                tempold[c].state = 3
+                if tempold[c].state == 2:
+                    tempold[c].state = 4
+                else:
+                    tempold[c].state = 3
                 tempnew[c] = tempold[c]
                 logging.debug("Found Delete:\t%s" % c)
                 progress += 1
@@ -414,35 +419,43 @@ def showlast():
 
 
 # #Sync a file to S3
-def syncfile(file: File, s3conn) -> bool:
+def syncfile(file: File, s3conn) -> int:
     # State: 0=no change, 1=updated, 2=new, 3=deleted
     filename = _config.s3path() + file.s3path
     if file.objecttype == "DIR":
         filename = filename + "/"
     if file.state in (1, 2):
-        r = False
+        r = -1
         if file.objecttype == "DIR":
             try:
                 s3conn.meta.client.put_object(Bucket=_config.s3bucket(), Key=filename)
-                r = True
+                r = 0
             except s3conn.meta.client.exceptions.ClientError as e:
+                stdout.write("\r")
                 logging.warning(e)
         else:
             try:
                 s3conn.meta.client.upload_file(file.fullpath, _config.s3bucket(), filename)
-                r = True
+                r = 0
             except boto3.exceptions.S3UploadFailedError as e:
+                stdout.write("\r")
                 logging.warning(e)
+            except OSError as e:
+                if e.errno == 2:
+                    r = 4
+                stdout.write("\r")
+                logging.warning("UPLOAD FAILED - File: %s, ErrorNo %d: %s" % (e.filename, e.errno, e.strerror))
         return r
     elif file.state == 3:
         try:
             s3conn.meta.client.delete_object(Bucket=_config.s3bucket(), Key=filename)
-            return True
+            return 4
         except s3conn.meta.client.exceptions.ClientError as e:
+            stdout.write("\r")
             logging.warning(e)
-            return False
+            return -1
     else:
-        return False
+        return -1
 
 
 # #Run sync for all files in DB, update if sync'd
@@ -468,12 +481,11 @@ def sync():
                 progress = 0
                 for f in flist:
                     logging.debug("Processing %s:" % f)
-                    if syncfile(flist[f], s3):
-                        flist[f].state = 0
+                    dostate = syncfile(flist[f], s3)
+                    if dostate >= 0:
+                        flist[f].state = dostate
                         filetodb(flist[f], dbconn)
                         dbconn.commit()
-                    else:
-                        logging.warning("File %s not uploaded." % f)
                     progress += 1
                     update_progress(progress/total)
                 # close connection
@@ -537,7 +549,7 @@ def s3delete() -> bool:
                     logging.info("%d objects deleted." % deleted)
             except client.exceptions.ClientError as e:
                 logging.warning(e)
-            except TypeError as e:
+            except TypeError:
                 logging.info("Directory %s does not exist in S3 or nothing to delete." % path)
         else:
             print("Delete canceled.")
